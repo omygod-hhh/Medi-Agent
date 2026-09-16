@@ -1,0 +1,141 @@
+---
+title: 部署指南 Deployment
+lang: zh-CN
+---
+
+# 🚀 部署指南
+
+> 生产环境: `https://openmedicareagent.online` | VPS: `root@47.108.235.30`
+
+---
+
+## 1. 标准部署流程
+
+### 自检仪式（每次执行前）
+
+```
+- [ ] 没有直接修改生产环境？
+- [ ] 本地代码已修改？
+- [ ] 修改内容已确认？
+```
+
+### 详细步骤
+
+```bash
+# 1. 本地修复
+# 在 ~/MediCareAI-Agent/ 修改代码
+
+# 2. 编译检查
+python3 -c "compile(open('backend/app/services/orchestrator.py').read(),'o','exec');print('OK')"
+cd frontend && npx tsc --noEmit
+
+# 3. Git 提交
+git add -A
+git commit -m "类型(范围): 描述"
+
+# 4. Git 推送
+echo '#!/bin/bash\necho "zhanxiaopi"' > /tmp/askpass.sh
+chmod +x /tmp/askpass.sh
+SSH_ASKPASS=/tmp/askpass.sh DISPLAY=dummy git push origin main
+
+# 5. VPS 拉取
+ssh root@47.108.235.30 "cd /opt/MediCareAI-Agent && git fetch origin && git reset --hard origin/main"
+
+# 6. 构建并部署（顺序构建！禁止并行）
+# 全量部署:
+ssh root@47.108.235.30 "cd /opt/MediCareAI-Agent && docker system prune -f && docker compose build --no-cache backend && docker compose build --no-cache frontend && docker compose up -d --force-recreate"
+
+# 仅前端:
+ssh root@47.108.235.30 "cd /opt/MediCareAI-Agent && docker compose build --no-cache frontend && docker compose up -d --force-recreate frontend"
+
+# 仅后端:
+ssh root@47.108.235.30 "cd /opt/MediCareAI-Agent && docker compose build --no-cache backend && docker compose up -d --force-recreate backend celery-worker celery-beat"
+
+# 7. 验证
+ssh root@47.108.235.30 "docker ps --format 'table {{.Names}}\t{{.Status}}'"
+curl -s -o /dev/null -w "%{http_code}" https://openmedicareagent.online/
+```
+
+---
+
+## 2. 容器架构
+
+| 容器 | 镜像 | 端口 |
+|------|------|------|
+| medicareai-backend | 自建 (Python 3.12) | 8000（内部） |
+| medicareai-frontend | 自建 (Node 22 + Nginx) | 80/443 |
+| medicareai-postgres | pgvector/pgvector:pg17 | 5432 |
+| medicareai-redis | redis:7-alpine | 6379 |
+| medicareai-celery | 自建 | — |
+| medicareai-celery-beat | 自建 | — |
+| medicareai-searxng | searxng/searxng | 8080 |
+| medicareai-valkey | valkey/valkey | 6379 |
+
+---
+
+## 3. 本地开发
+
+```bash
+git clone https://github.com/HougeLangley/MediCareAI-Agent.git
+cd MediCareAI-Agent
+cp .env.example .env
+# 编辑 .env 填入 API key
+
+docker compose up -d
+# API: http://localhost:8000
+# Swagger 文档: http://localhost:8000/docs
+```
+
+### 运行测试
+
+```bash
+cd backend
+pip install -e ".[dev]"
+pytest -q
+```
+
+---
+
+## 4. 调试命令
+
+### 容器健康
+
+```bash
+ssh root@47.108.235.30 "docker ps --format 'table {{.Names}}\t{{.Status}}'"
+```
+
+### 后端最近日志
+
+```bash
+ssh root@47.108.235.30 "docker logs medicareai-backend 2>&1 | tail -30"
+```
+
+### Chat 链路诊断
+
+```bash
+ssh root@47.108.235.30 "docker logs medicareai-backend 2>&1 | grep -E 'CHAT-CTX|CHAT-LLM|CHAT-OK' | tail -5"
+```
+
+### 数据库查询最近 session
+
+```bash
+ssh root@47.108.235.30 "docker exec medicareai-postgres psql -U postgres -d medicareai -c \"
+SELECT id, session_type, status, jsonb_array_length(context->'lab_reports') as lab_count,
+       created_at FROM agent_sessions ORDER BY created_at DESC LIMIT 10;\""
+```
+
+### 数据库迁移
+
+```bash
+ssh root@47.108.235.30 "docker exec medicareai-backend alembic upgrade head"
+ssh root@47.108.235.30 "docker exec medicareai-backend alembic heads"
+```
+
+---
+
+## 5. 构建规则
+
+1. **绝不并行构建** — Backend 先构建，Frontend 后构建
+2. **部署前清理** — `docker system prune -f`
+3. **每次部署必须验证** — 健康检查 + HTTP 200
+4. **管理员界面不由 Agent 测试** — 由管理员完成
